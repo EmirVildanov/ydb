@@ -122,10 +122,51 @@ TString SerializeBatch(const std::shared_ptr<arrow::RecordBatch>& batch, const a
     return NSerialization::TNativeSerializer(options).SerializePayload(batch);
 }
 
+TString SerializeBatchGorilla(const std::shared_ptr<arrow::RecordBatch>& batch, const arrow::ipc::IpcWriteOptions& options) {
+    return NSerialization::TGorillaSerializer(options).SerializePayload(batch);
+}
+
 TString SerializeBatchNoCompression(const std::shared_ptr<arrow::RecordBatch>& batch) {
     auto writeOptions = arrow::ipc::IpcWriteOptions::Defaults();
     writeOptions.use_threads = false;
     return SerializeBatch(batch, writeOptions);
+}
+
+const std::string GORILLA_COMPRESSED_DATA_COLUMN_NAME = "Data";
+
+TString SerializeBatchGorillaCompression(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    std::stringstream outStream;
+
+    auto timestampData = batch->column_data()[0];
+    arrow::TimestampArray castedTimestampData(timestampData);
+    auto valuesData = batch->column_data()[1];
+    arrow::UInt8Array castedValuesData(valuesData);
+    auto numRows = batch->num_rows();
+
+    // TODO: automatically detect header from first timestamp.
+    uint64_t header = 0;
+
+    Compressor c(outStream, header);
+    for (int i = 0; i < numRows; i++) {
+        c.compress(castedTimestampData[i], castedValuesData[i]);
+    }
+    c.finish();
+
+    arrow::UInt8Builder bytesBuilder;
+    const std::string& bytes = stream.str();
+    for (auto charByte : bytes) {
+        auto byte = static_cast<uint8_t>(charByte);
+        ARROW_RETURN_NOT_OK(bytesBuilder.Append(byte));
+    }
+    std::shared_ptr<arrow::Array> dataArray;
+    ARROW_ASSIGN_OR_RAISE(dataArray, bytesBuilder.Finish());
+    std::shared_ptr<arrow::Field> columnField = arrow::field(GORILLA_COMPRESSED_DATA_COLUMN_NAME, arrow::uint8());
+    std::shared_ptr<arrow::Schema> schema = arrow::schema({columnField});
+    std::shared_ptr<arrow::RecordBatch> compressedBatch = arrow::RecordBatch::Make(schema, bytes.size(), {dataArray});
+
+    auto writeOptions = arrow::ipc::IpcWriteOptions::Defaults();
+    writeOptions.use_threads = false;
+    return SerializeBatch(compressedBatch, writeOptions);
 }
 
 std::shared_ptr<arrow::RecordBatch> DeserializeBatch(const TString& blob, const std::shared_ptr<arrow::Schema>& schema)
