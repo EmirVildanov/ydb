@@ -54,6 +54,8 @@ TString SerializeBatchGorillaCompression(const std::shared_ptr<arrow::RecordBatc
 
 std::shared_ptr<arrow::RecordBatch> DeserializeBatch(const TString& blob,
                                                      const std::shared_ptr<arrow::Schema>& schema);
+std::shared_ptr<arrow::RecordBatch> DeserializeBatchGorilla(const TString& blob,
+                                                     const std::shared_ptr<arrow::Schema>& schema);
 std::shared_ptr<arrow::RecordBatch> MakeEmptyBatch(const std::shared_ptr<arrow::Schema>& schema, const ui32 rowsCount = 0);
 std::shared_ptr<arrow::Table> ToTable(const std::shared_ptr<arrow::RecordBatch>& batch);
 

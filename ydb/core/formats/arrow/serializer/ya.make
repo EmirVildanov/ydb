@@ -11,7 +11,6 @@ PEERDIR(
 SRCS(
     abstract.cpp
     GLOBAL native.cpp
-    GLOBAL gorilla.cpp
     stream.cpp
     parsing.cpp
 )

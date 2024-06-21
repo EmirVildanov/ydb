@@ -6,6 +6,7 @@
 #include "serializer/native.h"
 #include "serializer/abstract.h"
 #include "serializer/stream.h"
+#include "serializer/gorilla_inner.h"
 #include "simple_arrays_cache.h"
 
 #include <ydb/library/yverify_stream/yverify_stream.h>
@@ -22,6 +23,7 @@
 #include <library/cpp/containers/stack_vector/stack_vec.h>
 #include <ydb/library/actors/core/log.h>
 #include <memory>
+#include <sstream>
 
 #define Y_VERIFY_OK(status) Y_ABORT_UNLESS(status.ok(), "%s", status.ToString().c_str())
 
@@ -122,10 +124,6 @@ TString SerializeBatch(const std::shared_ptr<arrow::RecordBatch>& batch, const a
     return NSerialization::TNativeSerializer(options).SerializePayload(batch);
 }
 
-TString SerializeBatchGorilla(const std::shared_ptr<arrow::RecordBatch>& batch, const arrow::ipc::IpcWriteOptions& options) {
-    return NSerialization::TGorillaSerializer(options).SerializePayload(batch);
-}
-
 TString SerializeBatchNoCompression(const std::shared_ptr<arrow::RecordBatch>& batch) {
     auto writeOptions = arrow::ipc::IpcWriteOptions::Defaults();
     writeOptions.use_threads = false;
@@ -134,32 +132,36 @@ TString SerializeBatchNoCompression(const std::shared_ptr<arrow::RecordBatch>& b
 
 const std::string GORILLA_COMPRESSED_DATA_COLUMN_NAME = "Data";
 
+// TODO: Fix serialization algorithm for the case when we append rows to the existing table and not
+//       just serialize single already full table.
 TString SerializeBatchGorillaCompression(const std::shared_ptr<arrow::RecordBatch>& batch) {
     std::stringstream outStream;
 
     auto timestampData = batch->column_data()[0];
     arrow::TimestampArray castedTimestampData(timestampData);
     auto valuesData = batch->column_data()[1];
+    // TODO: value column may have different (non UInt8Array) type.
     arrow::UInt8Array castedValuesData(valuesData);
     auto numRows = batch->num_rows();
 
-    // TODO: automatically detect header from first timestamp.
-    uint64_t header = 0;
+    uint64_t firstTime = castedTimestampData.Value(0);
+    // Header is a first time aligned to 2 hours window.
+    uint64_t header = firstTime - (firstTime % (60 * 60 * 2));
 
     Compressor c(outStream, header);
     for (int i = 0; i < numRows; i++) {
-        c.compress(castedTimestampData[i], castedValuesData[i]);
+        c.compress(castedTimestampData.Value(i), castedValuesData.Value(i));
     }
     c.finish();
 
     arrow::UInt8Builder bytesBuilder;
-    const std::string& bytes = stream.str();
+    const std::string& bytes = outStream.str();
     for (auto charByte : bytes) {
         auto byte = static_cast<uint8_t>(charByte);
-        ARROW_RETURN_NOT_OK(bytesBuilder.Append(byte));
+        TStatusValidator::Validate(bytesBuilder.Append(byte));
     }
     std::shared_ptr<arrow::Array> dataArray;
-    ARROW_ASSIGN_OR_RAISE(dataArray, bytesBuilder.Finish());
+    TStatusValidator::Validate(bytesBuilder.Finish(&dataArray));
     std::shared_ptr<arrow::Field> columnField = arrow::field(GORILLA_COMPRESSED_DATA_COLUMN_NAME, arrow::uint8());
     std::shared_ptr<arrow::Schema> schema = arrow::schema({columnField});
     std::shared_ptr<arrow::RecordBatch> compressedBatch = arrow::RecordBatch::Make(schema, bytes.size(), {dataArray});
@@ -177,6 +179,48 @@ std::shared_ptr<arrow::RecordBatch> DeserializeBatch(const TString& blob, const 
     } else {
         AFL_ERROR(NKikimrServices::ARROW_HELPER)("event", "cannot_parse")("message", result.status().ToString())
             ("schema_columns_count", schema->num_fields())("schema_columns", JoinSeq(",", schema->field_names()));
+        return nullptr;
+    }
+}
+
+std::shared_ptr<arrow::RecordBatch> DeserializeBatchGorilla(const TString& blob, const std::shared_ptr<arrow::Schema>& schema)
+{
+    auto result = NSerialization::TNativeSerializer().Deserialize(blob, schema);
+    if (result.ok()) {
+        std::shared_ptr<arrow::RecordBatch> rawBytesBatch = *result;
+
+        auto timeColumnBuilder = arrow::TimestampBuilder(arrow::timestamp(arrow::TimeUnit::TimeUnit::MICRO), arrow::default_memory_pool());
+        // TODO: value column may have different (non UInt8Array) type.
+        arrow::UInt8Builder valueColumnBuilder;
+
+        auto columns_data = rawBytesBatch->column_data();
+        for (const auto& c_data : columns_data) {
+            std::stringstream in_stream;
+
+            arrow::UInt8Array castedArray(c_data);
+            for (auto value : castedArray) {
+                in_stream << *value;
+            }
+
+            Decompressor d(in_stream);
+            for (int i = 0; i < 3; i++) {
+                std::pair<uint64_t, uint64_t> current_pair = d.next();
+                TStatusValidator::Validate(timeColumnBuilder.Append(current_pair.first));
+                TStatusValidator::Validate(valueColumnBuilder.Append(current_pair.second));
+            }
+        }
+
+        std::shared_ptr<arrow::Array> timeColumnArray;
+        TStatusValidator::Validate(timeColumnBuilder.Finish(&timeColumnArray));
+        std::shared_ptr<arrow::Array> valueColumnArray;
+        TStatusValidator::Validate(valueColumnBuilder.Finish(&valueColumnArray));
+
+        std::shared_ptr<arrow::RecordBatch> finalBatch = arrow::RecordBatch::Make(schema, 2, {timeColumnArray, valueColumnArray});
+
+        return finalBatch;
+    } else {
+        AFL_ERROR(NKikimrServices::ARROW_HELPER)("event", "cannot_parse")("message", result.status().ToString())
+                ("schema_columns_count", schema->num_fields())("schema_columns", JoinSeq(",", schema->field_names()));
         return nullptr;
     }
 }
